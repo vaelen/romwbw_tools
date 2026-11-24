@@ -6,7 +6,7 @@ disk images:
 
 - **`romwbw-run`** boots the emulator with a ROM and a list of disks named on
   the command line, such as `romwbw-run cpm22 games tpascal`.
-- **`romwbw-disk`** builds a custom 8-slice disk image out of slices taken from
+- **`romwbw-disk`** builds a custom multi-slice disk image out of slices taken from
   the catalog's images, plus empty slices if you want them.
 
 Run either tool with no arguments and it walks you through a short series of
@@ -114,10 +114,12 @@ working copy.
 romwbw-disk [options] SLICE [SLICE ...]
 ```
 
-Builds a 65 MB combo image: an MBR followed by eight 8 MB slices. The slices
+Builds a combo image: a 1 MB MBR followed by 1 to 64 8 MB slices. The slices
 you name are copied into it byte for byte, in order, so the first becomes
-slice 0, the next slice 1, and so on. Slots you don't fill are empty,
-formatted CP/M slices. Slices keep their boot tracks, so a bootable slice
+slice 0, the next slice 1, and so on. The image has one slice per SLICE you
+name, or `--slices N` if that is more; the extra slots are empty, formatted
+CP/M slices. In the menus, you are asked for the total, which starts at the
+number of slices you picked. Slices keep their boot tracks, so a bootable slice
 boots from any position.
 
 A slice is:
@@ -131,6 +133,7 @@ A slice is:
 | Option             | Meaning                                                         |
 |--------------------|-----------------------------------------------------------------|
 | `-o`, `--output`   | image to write (default `custom.img`)                           |
+| `-n`, `--slices`   | total slices, 1-64 (default: one per SLICE named)               |
 | `-V`, `--version`  | RomWBW release to take the slices from                          |
 | `-f`, `--force`    | overwrite the output file if it exists                          |
 | `--cpm-disk`       | use this `cpm_disk.py` instead of the downloaded one            |
@@ -141,6 +144,7 @@ Examples:
 ```sh
 romwbw-disk -o mydisk.img cpm22 games tpascal
 romwbw-disk -o work.img cpm22 empty empty games
+romwbw-disk -n 16 -o big.img cpm22 games      # 14 empty slices after them
 romwbw-disk -V 3.5.1 -o old.img cpm22 combo:1
 ```
 
@@ -164,8 +168,8 @@ copy is run without the check. To move to a newer version, update
 `cpmDiskCommit` and `cpmDiskSHA256` together in `cmd/romwbw-disk/main.go`.
 
 `cpm_disk.py` only knows about six slices in a combo image. Its `--slice`
-option works on slices 0-5 of an image built here, but not 6 and 7. The
-emulator uses all eight.
+option works on slices 0-5 of an image built here, but not 6 and up. The
+emulator uses them all.
 
 ## License
 

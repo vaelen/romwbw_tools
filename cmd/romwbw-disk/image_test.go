@@ -35,14 +35,14 @@ func TestAssemble(t *testing.T) {
 	fill(t, single, false, 'S')
 	fill(t, combo, true, 'a', 'b', 'c')
 
-	if err := assemble(out, blank, []source{{combo, 2}, {}, {single, 0}, {combo, 0}}); err != nil {
+	if err := assemble(out, blank, []source{{combo, 2}, {}, {single, 0}, {combo, 0}}, 8); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(out)
-	if len(got) != prefixSize+outSlices*sliceSize {
+	if len(got) != prefixSize+8*sliceSize {
 		t.Fatalf("size %d", len(got))
 	}
-	if n := binary.LittleEndian.Uint32(got[0x1BE+12:]); n != outSlices*sliceSize/512 {
+	if n := binary.LittleEndian.Uint32(got[0x1BE+12:]); n != 8*sliceSize/512 {
 		t.Errorf("partition size %d sectors", n)
 	}
 	want := []byte{'c', 0xE5, 'S', 'a', 0xE5, 0xE5, 0xE5, 0xE5}
@@ -53,10 +53,16 @@ func TestAssemble(t *testing.T) {
 		}
 	}
 
-	if err := assemble(out, blank, []source{{combo, 3}}); err == nil {
+	if err := assemble(out, blank, []source{{single, 0}, {single, 0}}, 1); err == nil {
+		t.Error("two slices into a 1-slice image should fail")
+	}
+	if err := assemble(out, blank, nil, maxSlices+1); err == nil {
+		t.Error("more than maxSlices should fail")
+	}
+	if err := assemble(out, blank, []source{{combo, 3}}, 8); err == nil {
 		t.Error("slice 3 of a 3-slice combo should fail")
 	}
-	if err := assemble(out, blank, []source{{single, 1}}); err == nil {
+	if err := assemble(out, blank, []source{{single, 1}}, 8); err == nil {
 		t.Error("slice 1 of a single hd1k should fail")
 	}
 }

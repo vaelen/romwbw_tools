@@ -14,7 +14,9 @@ import (
 const (
 	sliceSize  = 8 << 20 // one hd1k slice
 	prefixSize = 1 << 20 // MBR prefix of a combo image
-	outSlices  = 8
+	// The stock combo MBR reserves 64 slices (512 MB) for the RomWBW
+	// partition, with a FAT partition right after it; more would overlap it.
+	maxSlices = 64
 )
 
 // source is one slice to copy: slice n of the image at path.
@@ -46,12 +48,16 @@ func sliceReader(f *os.File, n int) (io.Reader, error) {
 	}
 }
 
-// assemble writes an 8-slice combo image to out. blank is a combo image made
-// by `cpm_disk.py create --combo`: its MBR prefix is reused (with the RomWBW
-// partition grown to 8 slices) and its slice 0 fills any unused slot.
-func assemble(out, blank string, srcs []source) error {
-	if len(srcs) > outSlices {
-		return fmt.Errorf("%d slices given; the image holds %d", len(srcs), outSlices)
+// assemble writes a combo image of total slices to out. blank is a combo
+// image made by `cpm_disk.py create --combo`: its MBR prefix is reused (with
+// the RomWBW partition sized to total slices) and its slice 0 fills any
+// unused slot.
+func assemble(out, blank string, srcs []source, total int) error {
+	if total < 1 || total > maxSlices {
+		return fmt.Errorf("%d slices: must be 1-%d", total, maxSlices)
+	}
+	if len(srcs) > total {
+		return fmt.Errorf("%d slices given; the image holds %d", len(srcs), total)
 	}
 	bf, err := os.Open(blank)
 	if err != nil {
@@ -65,7 +71,7 @@ func assemble(out, blank string, srcs []source) error {
 	if prefix[0x1FE] != 0x55 || prefix[0x1FF] != 0xAA || prefix[0x1BE+4] != 0x2E {
 		return fmt.Errorf("%s has no RomWBW (0x2E) partition in its MBR", blank)
 	}
-	binary.LittleEndian.PutUint32(prefix[0x1BE+12:], outSlices*sliceSize/512)
+	binary.LittleEndian.PutUint32(prefix[0x1BE+12:], uint32(total*sliceSize/512))
 
 	// Write to a temp file beside the output and rename, so a failure never
 	// leaves a half-written image under the requested name.
@@ -78,7 +84,7 @@ func assemble(out, blank string, srcs []source) error {
 	if _, err := tmp.Write(prefix); err != nil {
 		return err
 	}
-	for slot := 0; slot < outSlices; slot++ {
+	for slot := 0; slot < total; slot++ {
 		src := source{path: blank}
 		if slot < len(srcs) && srcs[slot].path != "" {
 			src = srcs[slot]
@@ -111,4 +117,17 @@ func copySlice(w io.Writer, src source) error {
 		err = fmt.Errorf("%s slice %d: short read (%d bytes)", src.path, src.slice, n)
 	}
 	return err
+}
+
+// extractSlice writes slice n of image to path as a plain 8 MB hd1k image.
+func extractSlice(path, image string, n int) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := copySlice(f, source{path: image, slice: n}); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

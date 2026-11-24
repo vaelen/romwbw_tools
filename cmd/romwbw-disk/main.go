@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew C. Young <andrew@vaelen.org>
 // SPDX-License-Identifier: MIT
 
-// romwbw-disk builds a custom 8-slice RomWBW disk image out of slices taken
+// romwbw-disk builds a custom multi-slice RomWBW disk image out of slices taken
 // from the catalog's disk images.
 package main
 
@@ -33,22 +33,20 @@ const (
 	cpmDiskURL    = "https://raw.githubusercontent.com/avwohl/cpmemu/" + cpmDiskCommit + "/util/cpm_disk.py"
 )
 
-// cpm_disk.py's combo format knows six slices; slots 6 and 7 are beyond it.
-const scriptSlices = 6
-
-const usageText = `romwbw-disk - build a custom 8-slice RomWBW disk image from catalog slices
+const usageText = `romwbw-disk - build a custom RomWBW disk image from catalog slices
 
 USAGE
   romwbw-disk                          interactive menus (needs a terminal)
   romwbw-disk [options] SLICE [SLICE ...]
 
 DESCRIPTION
-  Builds one combo disk image (a 1 MB MBR prefix plus eight 8 MB hd1k slices,
-  65 MB in all) whose slices are copied, byte for byte, from disk images in the
-  romwbw-get catalog. Slices go into the new image in the order given: the
-  first SLICE becomes slice 0, the next slice 1, and so on. Up to 8 may be
-  given; any slots left over are blank, formatted, empty CP/M slices. A slice
-  keeps its boot tracks, so a bootable slice stays bootable in any position.
+  Builds one combo disk image (a 1 MB MBR prefix plus 1-64 8 MB hd1k slices)
+  whose slices are copied, byte for byte, from disk images in the romwbw-get
+  catalog. Slices go into the new image in the order given: the first SLICE
+  becomes slice 0, the next slice 1, and so on. The image has as many slices
+  as are given, or --slices N if that is more; the extra slots are blank,
+  formatted, empty CP/M slices. A slice keeps its boot tracks, so a bootable
+  slice stays bootable in any position.
 
   A SLICE is NAME, NAME:N, or the word empty
     NAME  a catalog disk id, with or without its "hd1k_" prefix (cpm22,
@@ -58,11 +56,11 @@ DESCRIPTION
           images (hd1k_combo has 6) have slices other than 0.
     empty a blank, formatted CP/M slice in that position, e.g. room for your
           own files between two catalog slices. Reserved: it never names a
-          catalog disk. Trailing empty slices need not be given; unused
-          slots are empty anyway.
+          catalog disk. Trailing empty slices are easier to ask for with
+          --slices.
 
   The blank image is made with cpm_disk.py (from github.com/avwohl/cpmemu),
-  which is then used to check the result. It needs python3. It is looked for
+  which is then used to check each slice of the result. It needs python3. It is looked for
   in this order:
     1. --cpm-disk PATH, then $CPM_DISK - used as given, not checked
     2. <romwbw-get cache-dir>/tools/cpm_disk-<commit>.py, downloaded there
@@ -79,7 +77,9 @@ BOOTING THE RESULT
 
 EXAMPLES
   romwbw-disk -o mydisk.img cpm22 games tpascal
-      CP/M 2.2, Games and Turbo Pascal as slices 0-2, five empty slices.
+      CP/M 2.2, Games and Turbo Pascal as slices 0-2 (a 25 MB image).
+  romwbw-disk -n 16 -o big.img cpm22 games
+      CP/M 2.2 and Games as slices 0-1, then 14 empty slices.
   romwbw-disk -o work.img cpm22 empty empty games
       CP/M 2.2 in slice 0, empty slices 1 and 2, Games in slice 3.
   romwbw-disk -o z.img combo:4 combo:0 wp
@@ -90,8 +90,8 @@ EXAMPLES
 NOTES
   - The result is a plain file you own; the guest writes to it directly.
   - cpm_disk.py's own combo support stops at six slices, so 'cpm_disk.py
-    --slice N' works on slices 0-5 of the result but not 6 and 7. The
-    emulator uses all eight.
+    --slice N' works on slices 0-5 of the result but not 6 and up. The
+    emulator uses them all.
   - Exit status: 0 on success, 1 on error, 2 on a usage error, 130 when the
     menus are cancelled.
 `
@@ -130,6 +130,7 @@ func (s spec) String() string {
 type options struct {
 	version, output, cpmDisk string
 	force                    bool
+	slices                   int // total slices in the image, >= len(specs)
 	specs                    []spec
 }
 
@@ -139,6 +140,7 @@ func run() error {
 	var o options
 	fs.StringVarP(&o.output, "output", "o", "custom.img", "image file to write")
 	fs.StringVarP(&o.version, "version", "V", "", "RomWBW release whose images to take slices from (3.6.0,\n3.5.1, ...). Default: the one romwbw-get has in use")
+	fs.IntVarP(&o.slices, "slices", "n", 0, fmt.Sprintf("total slices in the image, 1-%d; extra ones are empty.\nDefault: one per SLICE given", maxSlices))
 	fs.BoolVarP(&o.force, "force", "f", false, "overwrite the output file if it exists")
 	fs.StringVar(&o.cpmDisk, "cpm-disk", "", "path to cpm_disk.py (default: $CPM_DISK, else cached/downloaded)")
 	help := fs.BoolP("help", "h", false, "show this help")
@@ -170,8 +172,19 @@ func run() error {
 			fmt.Fprintln(os.Stderr, "romwbw-disk: no SLICE given; run 'romwbw-disk --help' for usage")
 			os.Exit(2)
 		}
-		if fs.NArg() > outSlices {
-			fmt.Fprintf(os.Stderr, "romwbw-disk: %d slices given; the image holds %d\n", fs.NArg(), outSlices)
+		if fs.NArg() > maxSlices {
+			fmt.Fprintf(os.Stderr, "romwbw-disk: %d slices given; an image holds at most %d\n", fs.NArg(), maxSlices)
+			os.Exit(2)
+		}
+		if o.slices == 0 {
+			o.slices = fs.NArg()
+		}
+		if o.slices < 1 || o.slices > maxSlices {
+			fmt.Fprintf(os.Stderr, "romwbw-disk: --slices %d: an image holds 1-%d slices\n", o.slices, maxSlices)
+			os.Exit(2)
+		}
+		if fs.NArg() > o.slices {
+			fmt.Fprintf(os.Stderr, "romwbw-disk: %d slices given for a %d-slice image\n", fs.NArg(), o.slices)
 			os.Exit(2)
 		}
 		if cat, err = rw.List(o.version); err != nil {
@@ -257,12 +270,18 @@ func buildImage(o options) error {
 			paths = paths[1:]
 		}
 	}
-	if err := assemble(o.output, blank, srcs); err != nil {
+	if err := assemble(o.output, blank, srcs, o.slices); err != nil {
 		return err
 	}
 
-	for n := 0; n < scriptSlices; n++ {
-		out, err := exec.Command("python3", "-I", script, "verify", "--slice", strconv.Itoa(n), o.output).CombinedOutput()
+	// cpm_disk.py only sees a combo in files of 6+ slices, and only slices
+	// 0-5 of it, so check each slice as a plain hd1k image of its own.
+	one := filepath.Join(tmp, "slice.img")
+	for n := 0; n < o.slices; n++ {
+		if err := extractSlice(one, o.output, n); err != nil {
+			return err
+		}
+		out, err := exec.Command("python3", "-I", script, "verify", one).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("wrote %s, but cpm_disk.py verify failed on slice %d: %v\n%s", o.output, n, err, out)
 		}
@@ -354,10 +373,10 @@ func download(url, path string) error {
 }
 
 func report(o options, cat *rw.Catalog, interactive bool) {
-	fmt.Printf("Wrote %s (8 slices, %d MB)\n\n", o.output, (prefixSize+outSlices*sliceSize)>>20)
+	fmt.Printf("Wrote %s (%d slices, %d MB)\n\n", o.output, o.slices, (prefixSize+o.slices*sliceSize)>>20)
 	fmt.Println("  Slice  From                    Boot with")
 	fmt.Println("  -----  ----------------------  ---------")
-	for slot := 0; slot < outSlices; slot++ {
+	for slot := 0; slot < o.slices; slot++ {
 		from := "(empty)"
 		if slot < len(o.specs) && o.specs[slot].id != "" {
 			s := o.specs[slot]
@@ -372,6 +391,9 @@ func report(o options, cat *rw.Catalog, interactive bool) {
 	fmt.Printf("\nBoot it:  romwbw-run %s\n", rw.ShellQuote([]string{path}))
 	if interactive {
 		argv := []string{"romwbw-disk", "--version", cat.Version, "-o", o.output}
+		if o.slices > len(o.specs) {
+			argv = append(argv, "--slices", strconv.Itoa(o.slices))
+		}
 		if o.force {
 			argv = append(argv, "--force")
 		}
@@ -402,7 +424,7 @@ func ask(o *options) (*rw.Catalog, error) {
 	}
 	var picked []int
 	for len(picked) == 0 {
-		if picked, err = tui.MultiSelect("Source images (up to 8)", items, nil, outSlices); err != nil {
+		if picked, err = tui.MultiSelect("Source images", items, nil, maxSlices); err != nil {
 			return nil, err
 		}
 	}
@@ -416,14 +438,14 @@ func ask(o *options) (*rw.Catalog, error) {
 			specs = append(specs, spec{id: d.ID})
 			continue
 		}
-		budget := outSlices - len(specs) - (len(picked) - i - 1)
+		budget := maxSlices - len(specs) - (len(picked) - i - 1)
 		sl := make([]tui.Item, d.SliceCount())
 		for n := range sl {
 			sl[n] = tui.Item{Label: fmt.Sprintf("slice %d", n)}
 		}
 		var ns []int
 		for len(ns) == 0 {
-			title := fmt.Sprintf("Slices of %s (up to %d)", rw.Short(d.ID, rw.DiskPrefix), budget)
+			title := "Slices of " + rw.Short(d.ID, rw.DiskPrefix)
 			if ns, err = tui.MultiSelect(title, sl, []int{0}, budget); err != nil {
 				return nil, err
 			}
@@ -433,19 +455,21 @@ func ask(o *options) (*rw.Catalog, error) {
 		}
 	}
 
-	if room := outSlices - len(specs); room > 0 {
-		counts := make([]tui.Item, room+1)
-		for n := range counts {
-			counts[n] = tui.Item{Label: strconv.Itoa(n)}
-		}
-		counts[0].Detail = "unused slots at the end are empty anyway"
-		n, err := tui.Select("Empty slices to place among them", counts, 0)
+	// Total slices: any beyond those picked are empty, and can be moved
+	// among them in the reorder step.
+	for {
+		title := fmt.Sprintf("Total slices (%d-%d; extras are empty)", len(specs), maxSlices)
+		v, err := tui.Input(title, strconv.Itoa(len(specs)))
 		if err != nil {
 			return nil, err
 		}
-		for ; n > 0; n-- {
-			specs = append(specs, spec{})
+		if n, err := strconv.Atoi(v); err == nil && n >= len(specs) && n <= maxSlices {
+			o.slices = n
+			break
 		}
+	}
+	for len(specs) < o.slices {
+		specs = append(specs, spec{})
 	}
 
 	if len(specs) > 1 {
@@ -462,6 +486,11 @@ func ask(o *options) (*rw.Catalog, error) {
 		}
 	} else {
 		o.specs = specs
+	}
+	// Trailing empties come from o.slices; dropping them keeps the rebuild
+	// command short (--slices N instead of "empty empty ...").
+	for len(o.specs) > 0 && o.specs[len(o.specs)-1].id == "" {
+		o.specs = o.specs[:len(o.specs)-1]
 	}
 
 	for {
