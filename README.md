@@ -128,6 +128,8 @@ A slice is:
 |-----------|--------------------------------------------------------------------|
 | `NAME`    | slice 0 of a catalog disk: `cpm22`, `games`, `hd1k_tpascal`, ...   |
 | `NAME:N`  | slice N of a multi-slice disk, such as `combo:3` (combo has 0-5)   |
+| `FILE`    | slice 0 of your own image or SD card, e.g. `./saved.img`           |
+| `FILE:N`  | slice N of your own image or SD card, e.g. `/dev/sda1:2`           |
 | `empty`   | an empty formatted slice in that position                          |
 
 | Option             | Meaning                                                         |
@@ -136,6 +138,9 @@ A slice is:
 | `-n`, `--slices`   | total slices, 1-64 (default: one per SLICE named)               |
 | `-V`, `--version`  | RomWBW release to take the slices from                          |
 | `-f`, `--force`    | overwrite the output file if it exists                          |
+| `--into`           | overwrite slices of this existing image or device instead       |
+| `--at`             | with `--into`: the first slice to overwrite (default 0)         |
+| `-y`, `--yes`      | with `--into` a device: don't ask first                         |
 | `--cpm-disk`       | use this `cpm_disk.py` instead of the downloaded one            |
 | `-h`, `--help`     | full help                                                       |
 
@@ -147,6 +152,36 @@ romwbw-disk -o work.img cpm22 empty empty games
 romwbw-disk -n 16 -o big.img cpm22 games      # 14 empty slices after them
 romwbw-disk -V 3.5.1 -o old.img cpm22 combo:1
 ```
+
+An argument is a file, as with `romwbw-run`, when it contains a `/` or ends
+in `.img`. That lets you save a slice and put it back later:
+
+```sh
+romwbw-disk -o saved.img ./mydisk.img:3    # slice 3 as a 1-slice image
+romwbw-disk -o new.img cpm22 ./saved.img   # back in, as slice 1
+```
+
+### Writing to an SD card
+
+Reading and writing SD cards is Linux-only for now (macOS and BSD are
+planned); image files work everywhere.
+
+`--into` overwrites slices of an existing image or SD card in place, leaving
+the rest of it alone. The first SLICE goes to slice `--at N`, the next to
+N+1, and so on:
+
+```sh
+romwbw-disk --into /dev/sda1 --at 3 cpm22   # slice 3 of the card := CP/M 2.2
+romwbw-disk --into /dev/sda1 --at 7 empty   # wipe slice 7
+romwbw-disk -o saved.img /dev/sda1:3        # copy slice 3 off the card
+```
+
+The card can be named whole (`/dev/sda`, where the slices are found from its
+partition table) or by its RomWBW partition (`/dev/sda1`, where they start at
+offset 0). For a device it asks before writing (`--yes` skips the question),
+won't write while the device is mounted, and checks the written slices with
+`cpm_disk.py` afterwards. Writing usually needs permission: `sudo chown $USER
+/dev/sda1` lasts until the card is removed.
 
 When it finishes it prints which slice came from where and the `--boot` value
 that boots each one. To use the image:

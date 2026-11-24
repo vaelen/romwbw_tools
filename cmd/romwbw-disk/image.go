@@ -5,10 +5,12 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 const (
@@ -26,26 +28,69 @@ type source struct {
 	slice int
 }
 
-// sliceReader returns slice n of an hd1k image (8 MB, slice 0 only) or of a
-// combo image (1 MB prefix + k x 8 MB).
+// openImage opens an image file or device, saying how to get access to a
+// card when that is what's missing.
+func openImage(path string, flag int) (*os.File, error) {
+	f, err := os.OpenFile(path, flag, 0)
+	if errors.Is(err, os.ErrPermission) {
+		return nil, fmt.Errorf("%w; for an SD card, 'sudo chown $USER %s' gives you access until it is removed", err, path)
+	}
+	return f, err
+}
+
+// layout finds the slices in an image file or device: the offset of slice 0
+// and how many whole slices there are. It knows
+//   - a plain hd1k image: exactly 8 MB, one slice
+//   - anything whose sector 0 is an MBR with a RomWBW (0x2E) partition: a
+//     combo image, or a whole SD card such as /dev/sda; the slices fill that
+//     partition, as far as the file or device actually goes
+//   - otherwise a run of slices from offset 0, such as the RomWBW partition
+//     of a card on its own (/dev/sda1). Plain hd1k slices carry an MBR of
+//     their own in sector 0, but without a 0x2E entry, so they land here.
+func layout(f *os.File) (base int64, count int, err error) {
+	// Stat reports 0 for a block device; seeking to the end gives its size on
+	// Linux. ponytail: Linux only. macOS and BSD report 0 here too and need
+	// an ioctl (DKIOCGETBLOCKCOUNT, DIOCGMEDIASIZE) to support cards there.
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, 0, err
+	}
+	if size == sliceSize {
+		return 0, 1, nil
+	}
+	mbr := make([]byte, 512)
+	if _, err := f.ReadAt(mbr, 0); err != nil {
+		return 0, 0, fmt.Errorf("%s: reading sector 0: %w", f.Name(), err)
+	}
+	if mbr[0x1FE] == 0x55 && mbr[0x1FF] == 0xAA {
+		for e := mbr[0x1BE:0x1FE]; len(e) > 0; e = e[16:] {
+			if e[4] != 0x2E {
+				continue
+			}
+			start := int64(binary.LittleEndian.Uint32(e[8:])) * 512
+			length := int64(binary.LittleEndian.Uint32(e[12:])) * 512
+			if start <= 0 || start >= size {
+				return 0, 0, fmt.Errorf("%s: its RomWBW partition starts at byte %d, outside the %d bytes there are", f.Name(), start, size)
+			}
+			return start, int(min(length, size-start) / sliceSize), nil
+		}
+	}
+	if size > 0 && size%sliceSize == 0 {
+		return 0, int(size / sliceSize), nil
+	}
+	return 0, 0, fmt.Errorf("%s: %d bytes with no RomWBW partition is not a whole number of 8 MB slices", f.Name(), size)
+}
+
+// sliceReader returns slice n of the image or device f (see layout).
 func sliceReader(f *os.File, n int) (io.Reader, error) {
-	fi, err := f.Stat()
+	base, k, err := layout(f)
 	if err != nil {
 		return nil, err
 	}
-	size := fi.Size()
-	switch {
-	case size == sliceSize && n == 0:
-		return io.NewSectionReader(f, 0, sliceSize), nil
-	case size > prefixSize && (size-prefixSize)%sliceSize == 0:
-		k := int((size - prefixSize) / sliceSize)
-		if n < 0 || n >= k {
-			return nil, fmt.Errorf("%s has slices 0-%d, not %d", f.Name(), k-1, n)
-		}
-		return io.NewSectionReader(f, prefixSize+int64(n)*sliceSize, sliceSize), nil
-	default:
-		return nil, fmt.Errorf("%s: %d bytes is neither an 8 MB hd1k image nor a combo; can't take slice %d", f.Name(), size, n)
+	if n < 0 || n >= k {
+		return nil, fmt.Errorf("%s has slices 0-%d, not %d", f.Name(), k-1, n)
 	}
+	return io.NewSectionReader(f, base+int64(n)*sliceSize, sliceSize), nil
 }
 
 // assemble writes a combo image of total slices to out. blank is a combo
@@ -103,7 +148,7 @@ func assemble(out, blank string, srcs []source, total int) error {
 }
 
 func copySlice(w io.Writer, src source) error {
-	f, err := os.Open(src.path)
+	f, err := openImage(src.path, os.O_RDONLY)
 	if err != nil {
 		return err
 	}
@@ -130,4 +175,82 @@ func extractSlice(path, image string, n int) error {
 		return err
 	}
 	return f.Close()
+}
+
+// writeInto overwrites slices at, at+1, ... of the existing image file or
+// device dest with srcs, and leaves the rest of it alone. A source with no
+// path is slice 0 of blank, a formatted empty slice.
+//
+// ponytail: each source is read just before its slot is written, so taking a
+// source from a slot of dest that this same call already overwrote copies the
+// new data; buffer every source first if that ever matters.
+func writeInto(dest, blank string, at int, srcs []source) error {
+	srcs = append([]source(nil), srcs...)
+	for i := range srcs {
+		if srcs[i].path == "" {
+			srcs[i] = source{path: blank}
+		}
+	}
+	// Check every source before the first write, so a bad one changes nothing.
+	for _, s := range srcs {
+		if err := copySlice(io.Discard, s); err != nil {
+			return err
+		}
+	}
+
+	fi, err := os.Stat(dest)
+	if err != nil {
+		return err
+	}
+	flag := os.O_RDWR
+	if fi.Mode()&os.ModeDevice != 0 {
+		// On Linux, O_EXCL without O_CREAT on a block device fails with EBUSY
+		// while anything has it (or, for a whole disk, a partition) mounted.
+		// Elsewhere it is ignored; macOS gives EBUSY for a mounted disk anyway.
+		flag |= syscall.O_EXCL
+	}
+	f, err := openImage(dest, flag)
+	if errors.Is(err, syscall.EBUSY) {
+		return fmt.Errorf("%s is in use, probably mounted; unmount it, or name just its RomWBW partition (such as /dev/sda1)", dest)
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	base, count, err := layout(f)
+	if err != nil {
+		return err
+	}
+	if at < 0 || at+len(srcs) > count {
+		return fmt.Errorf("%s has slices 0-%d; can't write slices %d-%d", dest, count-1, at, at+len(srcs)-1)
+	}
+
+	buf := make([]byte, sliceSize)
+	for i, s := range srcs {
+		if err := readSlice(buf, s); err != nil {
+			return err
+		}
+		if _, err := f.WriteAt(buf, base+int64(at+i)*sliceSize); err != nil {
+			return fmt.Errorf("writing slice %d of %s: %w", at+i, dest, err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// readSlice fills buf (one slice long) with src.
+func readSlice(buf []byte, src source) error {
+	f, err := openImage(src.path, os.O_RDONLY)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	r, err := sliceReader(f, src.slice)
+	if err != nil {
+		return err
+	}
+	_, err = io.ReadFull(r, buf)
+	return err
 }

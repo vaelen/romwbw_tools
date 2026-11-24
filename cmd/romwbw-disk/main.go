@@ -38,6 +38,7 @@ const usageText = `romwbw-disk - build a custom RomWBW disk image from catalog s
 USAGE
   romwbw-disk                          interactive menus (needs a terminal)
   romwbw-disk [options] SLICE [SLICE ...]
+  romwbw-disk --into DEST [--at N] SLICE [SLICE ...]
 
 DESCRIPTION
   Builds one combo disk image (a 1 MB MBR prefix plus 1-64 8 MB hd1k slices)
@@ -48,10 +49,14 @@ DESCRIPTION
   formatted, empty CP/M slices. A slice keeps its boot tracks, so a bootable
   slice stays bootable in any position.
 
-  A SLICE is NAME, NAME:N, or the word empty
+  A SLICE is NAME, NAME:N, FILE, FILE:N, or the word empty
     NAME  a catalog disk id, with or without its "hd1k_" prefix (cpm22,
           games, hd1k_tpascal, combo, ...). 'romwbw-get list --disks' lists
           them; the catalog is read at runtime.
+    FILE  your own image or an SD card: an 8 MB hd1k image, a combo (such as
+          one made by this program), a whole card (/dev/sda) or its RomWBW
+          partition (/dev/sda1). Taken as a file when it contains a '/' or
+          ends in .img, e.g. ./mydisk.img:2 or /dev/sda1:3.
     N     which slice of that image to take. Default 0. Only multi-slice
           images (hd1k_combo has 6) have slices other than 0.
     empty a blank, formatted CP/M slice in that position, e.g. room for your
@@ -67,6 +72,19 @@ DESCRIPTION
        on first use from a pinned cpmemu commit
   The cached copy must match a SHA-256 built into this program, both when it
   is downloaded and each time it is used; on a mismatch nothing is run.
+
+WRITING INTO AN EXISTING IMAGE OR SD CARD
+  --into DEST overwrites slices of DEST in place instead of making a new
+  image: the first SLICE goes to slice --at N (default 0), the next to N+1,
+  and so on. Nothing else in DEST changes. DEST is an image file, a whole
+  card (/dev/sda: the slices are found from its partition table) or the
+  card's RomWBW partition (/dev/sda1). The written slices are checked with
+  cpm_disk.py afterwards.
+
+  Reading and writing devices is Linux-only for now; image files work
+  anywhere. For a device it asks first (--yes skips that), and refuses
+  while the device is mounted. Writing a device usually needs permission: 'sudo chown
+  $USER /dev/sda1' lasts until the card is removed.
 
 OPTIONS
 %s
@@ -84,6 +102,16 @@ EXAMPLES
       CP/M 2.2 in slice 0, empty slices 1 and 2, Games in slice 3.
   romwbw-disk -o z.img combo:4 combo:0 wp
       Slice 4 of the combo disk, then its slice 0, then Word Processing.
+  romwbw-disk -o saved.img ./mydisk.img:3
+      Save slice 3 of mydisk.img as a 1-slice image of its own...
+  romwbw-disk -o new.img cpm22 ./saved.img
+      ...and put it back later, here as slice 1 after CP/M 2.2.
+  romwbw-disk --into /dev/sda1 --at 3 cpm22
+      Overwrite slice 3 of the SD card with CP/M 2.2.
+  romwbw-disk --into /dev/sda1 --at 7 empty
+      Wipe slice 7 of the SD card to an empty, formatted slice.
+  romwbw-disk -o saved.img /dev/sda1:3
+      Copy slice 3 of the SD card into an image file.
   romwbw-disk --version 3.5.1 -o old.img cpm22 games
       Take the slices from the RomWBW 3.5.1 images.
 
@@ -109,28 +137,35 @@ func main() {
 // emptyName is the reserved SLICE word for a blank, formatted slice.
 const emptyName = "empty"
 
-// spec is one requested slice: slice n of catalog disk id, or an empty
-// slice when id is "".
+// spec is one requested slice: slice n of catalog disk id, or of image file
+// file, or an empty slice when both are "".
 type spec struct {
-	id string
-	n  int
+	id, file string
+	n        int
 }
 
+func (s spec) empty() bool { return s.id == "" && s.file == "" }
+
 func (s spec) String() string {
-	if s.id == "" {
+	name := s.file
+	switch {
+	case s.empty():
 		return emptyName
+	case s.id != "":
+		name = rw.Short(s.id, rw.DiskPrefix)
 	}
-	short := rw.Short(s.id, rw.DiskPrefix)
 	if s.n == 0 {
-		return short
+		return name
 	}
-	return fmt.Sprintf("%s:%d", short, s.n)
+	return fmt.Sprintf("%s:%d", name, s.n)
 }
 
 type options struct {
 	version, output, cpmDisk string
-	force                    bool
-	slices                   int // total slices in the image, >= len(specs)
+	force, yes               bool
+	slices                   int    // total slices in the image, >= len(specs)
+	into                     string // write into this existing image or device instead
+	at                       int    // ...starting at this slice
 	specs                    []spec
 }
 
@@ -142,6 +177,9 @@ func run() error {
 	fs.StringVarP(&o.version, "version", "V", "", "RomWBW release whose images to take slices from (3.6.0,\n3.5.1, ...). Default: the one romwbw-get has in use")
 	fs.IntVarP(&o.slices, "slices", "n", 0, fmt.Sprintf("total slices in the image, 1-%d; extra ones are empty.\nDefault: one per SLICE given", maxSlices))
 	fs.BoolVarP(&o.force, "force", "f", false, "overwrite the output file if it exists")
+	fs.StringVar(&o.into, "into", "", "instead of a new image, overwrite slices of this existing\nimage file or device (an SD card such as /dev/sda1; devices: Linux only)")
+	fs.IntVar(&o.at, "at", 0, "with --into: the first slice to overwrite")
+	fs.BoolVarP(&o.yes, "yes", "y", false, "with --into a device: don't ask before writing to it")
 	fs.StringVar(&o.cpmDisk, "cpm-disk", "", "path to cpm_disk.py (default: $CPM_DISK, else cached/downloaded)")
 	help := fs.BoolP("help", "h", false, "show this help")
 	fs.SetOutput(os.Stderr)
@@ -176,6 +214,14 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "romwbw-disk: %d slices given; an image holds at most %d\n", fs.NArg(), maxSlices)
 			os.Exit(2)
 		}
+		if o.into != "" && (fs.Changed("output") || fs.Changed("slices") || o.force) {
+			fmt.Fprintln(os.Stderr, "romwbw-disk: --into writes to an existing image; -o, --slices and --force don't apply")
+			os.Exit(2)
+		}
+		if o.into == "" && (fs.Changed("at") || o.yes) {
+			fmt.Fprintln(os.Stderr, "romwbw-disk: --at and --yes go with --into")
+			os.Exit(2)
+		}
 		if o.slices == 0 {
 			o.slices = fs.NArg()
 		}
@@ -197,7 +243,11 @@ func run() error {
 			}
 			o.specs = append(o.specs, s)
 		}
-		if _, err := os.Stat(o.output); err == nil && !o.force {
+		if o.into != "" {
+			if err := confirmInto(o); err != nil {
+				return err
+			}
+		} else if _, err := os.Stat(o.output); err == nil && !o.force {
 			return fmt.Errorf("%s exists; use --force to overwrite it", o.output)
 		}
 	}
@@ -210,6 +260,20 @@ func run() error {
 }
 
 func parseSpec(a string, cat *rw.Catalog) (spec, error) {
+	if rw.IsFile(a) {
+		// Split on the last ':' only when a number follows, so a path may
+		// itself contain ':'. The slice is range-checked when it is copied.
+		s := spec{file: a}
+		if i := strings.LastIndexByte(a, ':'); i >= 0 {
+			if n, err := strconv.Atoi(a[i+1:]); err == nil && n >= 0 {
+				s.file, s.n = a[:i], n
+			}
+		}
+		if _, err := os.Stat(s.file); err != nil {
+			return spec{}, err
+		}
+		return s, nil
+	}
 	name, num, hasNum := strings.Cut(a, ":")
 	if strings.EqualFold(name, emptyName) {
 		if hasNum {
@@ -265,20 +329,30 @@ func buildImage(o options) error {
 
 	srcs := make([]source, len(o.specs))
 	for i, s := range o.specs {
-		if s.id != "" { // empty specs keep a zero source: a blank slice
+		switch { // empty specs keep a zero source: a blank slice
+		case s.file != "":
+			srcs[i] = source{path: s.file, slice: s.n}
+		case s.id != "":
 			srcs[i] = source{path: paths[0], slice: s.n}
 			paths = paths[1:]
 		}
 	}
-	if err := assemble(o.output, blank, srcs, o.slices); err != nil {
+	dest, first, last := o.output, 0, o.slices
+	if o.into != "" {
+		dest, first, last = o.into, o.at, o.at+len(srcs)
+		err = writeInto(o.into, blank, o.at, srcs)
+	} else {
+		err = assemble(o.output, blank, srcs, o.slices)
+	}
+	if err != nil {
 		return err
 	}
 
 	// cpm_disk.py only sees a combo in files of 6+ slices, and only slices
 	// 0-5 of it, so check each slice as a plain hd1k image of its own.
 	one := filepath.Join(tmp, "slice.img")
-	for n := 0; n < o.slices; n++ {
-		if err := extractSlice(one, o.output, n); err != nil {
+	for n := first; n < last; n++ {
+		if err := extractSlice(one, dest, n); err != nil {
 			return err
 		}
 		out, err := exec.Command("python3", "-I", script, "verify", one).CombinedOutput()
@@ -372,15 +446,69 @@ func download(url, path string) error {
 	return os.Rename(f.Name(), path)
 }
 
+// confirmInto checks that o.into can take the slices at o.at and, when it is
+// a device, asks before going on (unless --yes).
+func confirmInto(o options) error {
+	f, err := openImage(o.into, os.O_RDONLY)
+	if err != nil {
+		return err
+	}
+	_, count, err := layout(f)
+	fi, _ := f.Stat()
+	f.Close()
+	if err != nil {
+		return err
+	}
+	last := o.at + len(o.specs) - 1
+	if o.at < 0 || last >= count {
+		return fmt.Errorf("%s has slices 0-%d; can't write slices %d-%d", o.into, count-1, o.at, last)
+	}
+	if fi.Mode()&os.ModeDevice == 0 || o.yes {
+		return nil
+	}
+	if !tui.IsTerminal() {
+		return fmt.Errorf("%s is a device; pass --yes to write to it without asking", o.into)
+	}
+	which := fmt.Sprintf("slice %d", o.at)
+	if last > o.at {
+		which = fmt.Sprintf("slices %d-%d", o.at, last)
+	}
+	ok, err := tui.Confirm(fmt.Sprintf("Overwrite %s of %s (%d slices)? What is there now is lost.", which, o.into, count), false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return tui.ErrAborted
+	}
+	return nil
+}
+
 func report(o options, cat *rw.Catalog, interactive bool) {
-	fmt.Printf("Wrote %s (%d slices, %d MB)\n\n", o.output, o.slices, (prefixSize+o.slices*sliceSize)>>20)
+	if o.into != "" {
+		fmt.Printf("Wrote %s:\n\n", o.into)
+		fmt.Println("  Slice  From")
+		fmt.Println("  -----  ----------------------")
+		for i, s := range o.specs {
+			from := "(empty)"
+			if !s.empty() {
+				from = fmt.Sprintf("%s slice %d", s.id+s.file, s.n)
+			}
+			fmt.Printf("  %-5d  %s\n", o.at+i, from)
+		}
+		return
+	}
+	plural := "s"
+	if o.slices == 1 {
+		plural = ""
+	}
+	fmt.Printf("Wrote %s (%d slice%s, %d MB)\n\n", o.output, o.slices, plural, (prefixSize+o.slices*sliceSize)>>20)
 	fmt.Println("  Slice  From                    Boot with")
 	fmt.Println("  -----  ----------------------  ---------")
 	for slot := 0; slot < o.slices; slot++ {
 		from := "(empty)"
-		if slot < len(o.specs) && o.specs[slot].id != "" {
+		if slot < len(o.specs) && !o.specs[slot].empty() {
 			s := o.specs[slot]
-			from = fmt.Sprintf("%s slice %d", s.id, s.n)
+			from = fmt.Sprintf("%s slice %d", s.id+s.file, s.n)
 		}
 		fmt.Printf("  %-5d  %-22s  --boot=2.%d\n", slot, from, slot)
 	}
@@ -489,7 +617,7 @@ func ask(o *options) (*rw.Catalog, error) {
 	}
 	// Trailing empties come from o.slices; dropping them keeps the rebuild
 	// command short (--slices N instead of "empty empty ...").
-	for len(o.specs) > 0 && o.specs[len(o.specs)-1].id == "" {
+	for len(o.specs) > 0 && o.specs[len(o.specs)-1].empty() {
 		o.specs = o.specs[:len(o.specs)-1]
 	}
 

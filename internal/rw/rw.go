@@ -139,6 +139,11 @@ func CacheDir() (string, error) {
 	return string(bytes.TrimSpace(out)), err
 }
 
+// IsFile says whether an argument names a local image rather than a catalog id.
+func IsFile(s string) bool {
+	return strings.ContainsRune(s, '/') || strings.HasSuffix(strings.ToLower(s), ".img")
+}
+
 // Short drops the catalog prefix: hd1k_games -> games, emu_avw -> avw.
 func Short(id, prefix string) string { return strings.TrimPrefix(id, prefix) }
 

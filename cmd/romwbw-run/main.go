@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/spf13/pflag"
@@ -172,11 +171,6 @@ func run() error {
 	return syscall.Exec(bin, argv, os.Environ())
 }
 
-// isFile says whether a DISK argument names a local image rather than a catalog id.
-func isFile(s string) bool {
-	return strings.ContainsRune(s, '/') || strings.HasSuffix(strings.ToLower(s), ".img")
-}
-
 // build resolves the plan against the catalog and returns romwbw_emu's argv.
 func build(p plan, emu string) ([]string, error) {
 	cat, err := rw.List(p.version)
@@ -205,7 +199,7 @@ func build(p plan, emu string) ([]string, error) {
 	var slots []int
 	seen := map[string]bool{}
 	for i, d := range disks {
-		if isFile(d) {
+		if rw.IsFile(d) {
 			abs, err := filepath.Abs(d)
 			if err != nil {
 				return nil, err

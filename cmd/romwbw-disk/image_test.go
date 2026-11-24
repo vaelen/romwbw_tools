@@ -18,6 +18,8 @@ func fill(t *testing.T, path string, prefix bool, marks ...byte) {
 	if prefix {
 		p := make([]byte, prefixSize)
 		p[0x1FE], p[0x1FF], p[0x1BE+4] = 0x55, 0xAA, 0x2E
+		binary.LittleEndian.PutUint32(p[0x1BE+8:], prefixSize/512)
+		binary.LittleEndian.PutUint32(p[0x1BE+12:], maxSlices*sliceSize/512) // like the stock combo
 		b = append(b, p...)
 	}
 	for _, m := range marks {
@@ -64,5 +66,61 @@ func TestAssemble(t *testing.T) {
 	}
 	if err := assemble(out, blank, []source{{single, 1}}, 8); err == nil {
 		t.Error("slice 1 of a single hd1k should fail")
+	}
+}
+
+func TestLayout(t *testing.T) {
+	d := t.TempDir()
+	for _, c := range []struct {
+		name   string
+		prefix bool
+		marks  []byte
+		base   int64
+		count  int
+	}{
+		{"hd1k", false, []byte{'S'}, 0, 1},
+		{"combo", true, []byte{'a', 'b', 'c'}, prefixSize, 3}, // partition says 64; file has 3
+		{"partition", false, []byte{'a', 'b'}, 0, 2},          // like /dev/sda1
+	} {
+		p := filepath.Join(d, c.name)
+		fill(t, p, c.prefix, c.marks...)
+		f, _ := os.Open(p)
+		base, count, err := layout(f)
+		f.Close()
+		if err != nil || base != c.base || count != c.count {
+			t.Errorf("%s: got %d, %d, %v; want %d, %d", c.name, base, count, err, c.base, c.count)
+		}
+	}
+}
+
+func TestWriteInto(t *testing.T) {
+	d := t.TempDir()
+	blank, single, dest := filepath.Join(d, "blank"), filepath.Join(d, "single"), filepath.Join(d, "dest")
+	fill(t, blank, true, 0xE5)
+	fill(t, single, false, 'S')
+	fill(t, dest, false, 'a', 'b', 'c', 'd') // a bare partition, like /dev/sda1
+
+	if err := writeInto(dest, blank, 1, []source{{single, 0}, {}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(dest)
+	if len(got) != 4*sliceSize {
+		t.Fatalf("size %d", len(got))
+	}
+	for i, w := range []byte{'a', 'S', 0xE5, 'd'} {
+		if off := i * sliceSize; got[off] != w || got[off+sliceSize-1] != w {
+			t.Errorf("slot %d: got %q, want %q", i, got[off], w)
+		}
+	}
+
+	before, _ := os.ReadFile(dest)
+	if err := writeInto(dest, blank, 3, []source{{single, 0}, {single, 0}}); err == nil {
+		t.Error("writing past the last slice should fail")
+	}
+	if err := writeInto(dest, blank, 0, []source{{single, 0}, {single, 1}}); err == nil {
+		t.Error("a bad source should fail")
+	}
+	if after, _ := os.ReadFile(dest); !bytes.Equal(before, after) {
+		t.Error("a failed writeInto changed the image")
 	}
 }
